@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+.pw-profile
+.pycache
+__pycache__
+*.py[cod]
+*.pdf
+my_docs
+aima_config.json
+aima_residence_config.json
+.env
+.DS_Store

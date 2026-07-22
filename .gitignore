@@ -1,5 +1,6 @@
 .venv/
 .pw-profile/
+.pycache/
 aima_config.json
 aima_residence_config.json
 __pycache__/
@@ -8,3 +9,5 @@ __pycache__/
 .Python
 .env
 .DS_Store
+*.pdf
+my_docs/
