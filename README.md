@@ -1,86 +1,137 @@
-# AIMA Telegram bot
+# Get AIMA status
 
-This project provides:
+Unofficial helper for Portugal’s [AIMA contact form](https://contactenos.aima.gov.pt/contact-form).  
+It requests a status update for a **passport** or **residence permit** (topic/subtopic used by the public form).
 
-- standalone passport and residence-permit scripts;
-- a Telegram bot with both document flows;
-- temporary Supabase conversation state;
-- a Railway Docker deployment.
+Not affiliated with AIMA. Use at your own risk and only with your own data.
 
-The bot asks for each field, requests the email MFA code, and submits the AIMA
-request through a serialized Playwright browser worker.
+## Two ways to run it
 
-## Privacy
+| | Telegram bot | Local one-time script |
+|---|---|---|
+| **For** | You or others via chat | A single run on your machine |
+| **Entry** | `./run_bot.sh` | `python aima_form.py` / `aima_residence_form.py` |
+| **Needs** | Telegram token, Supabase, local browser | Config JSON, local browser |
 
-Personal data is stored in `aima_bot_sessions` only while a request is active.
-The row is deleted after submission, `/cancel`, or after a 30-minute timeout.
-An expired-row cleanup job runs every 10 minutes.
+Both paths share `aima_service.py` and open a **headed Chrome/Chromium** window via Playwright. The host must be able to reach AIMA (many US cloud IPs cannot).
 
-The Supabase table has RLS enabled and no client policies. Only the server-side
-service-role key can access it. Never expose that key publicly.
+## Requirements
 
-The bot also tries to delete sensitive incoming Telegram messages. This is
-best-effort: Telegram may retain messages according to its own privacy policy.
+- Python 3.9+
+- macOS or Linux with a display (browser is not headless)
+- Network access to `contactenos.aima.gov.pt` and `api-contactenos.aima.gov.pt`
 
-## Supabase setup
-
-1. Create a Supabase project.
-2. Open **SQL Editor**.
-3. Run the contents of `supabase_schema.sql`.
-4. Open **Settings → API Keys** and copy the project URL and a secret
-   (`sb_secret_...`) key. A legacy `service_role` key also works.
-
-## Telegram setup
-
-Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
-
-Available commands:
-
-- `/start` — begin a passport or residence-permit request;
-- `/cancel` — delete the current temporary session.
-
-## Railway deployment
-
-1. Put this project in a private GitHub repository.
-2. Create a Railway project from that repository.
-3. Add these Railway variables:
-
-   ```text
-   TELEGRAM_BOT_TOKEN=...
-   SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-   SUPABASE_SECRET_KEY=sb_secret_...
-   BROWSER_PROFILE_DIR=/data/.pw-profile
-   ```
-
-4. Add a Railway volume mounted at `/data`. This preserves the browser profile
-   between deployments.
-5. Deploy. Railway uses `Dockerfile` and starts `telegram_bot.py`.
-
-Only run one replica. The persistent browser profile is intentionally processed
-serially and cannot be shared safely between concurrent replicas.
-
-## Local bot run
+## Install
 
 ```bash
+git clone https://github.com/vrnch/get-aima-status.git
+cd get-aima-status
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-Export the three required secrets, then run:
+---
+
+## Option A — Telegram bot
+
+### 1. Supabase
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. SQL Editor → run [`supabase_schema.sql`](supabase_schema.sql).
+3. Project Settings → API → copy:
+   - Project URL (`https://xxxx.supabase.co`, **without** `/rest/v1`)
+   - Secret key (`sb_secret_...`)
+
+### 2. Telegram
+
+Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+
+### 3. Environment
 
 ```bash
-python telegram_bot.py
+cp .env.example .env
 ```
 
-On a Linux server, the included Docker image runs the visible browser inside
-Xvfb.
+Fill in:
 
-## Important limitation
+```text
+TELEGRAM_BOT_TOKEN=...
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SECRET_KEY=sb_secret_...
+BUYMEACOFFEE_URL=          # optional tip link after success
+# BROWSER_PROFILE_DIR=     # optional; default ./.pw-profile
+```
 
-AIMA uses reCAPTCHA Enterprise. Tokens generated from hosted datacenter
-browsers may receive a low score and be rejected even when the implementation
-is correct. Railway deployment cannot guarantee that AIMA will accept the
-automated browser. Do not attempt to bypass interactive challenges or operate
-the bot at abusive volume.
+### 4. Run
+
+```bash
+chmod +x run_bot.sh
+./run_bot.sh
+```
+
+Leave the Chrome window open while the bot is running. Keep the machine awake.
+
+In Telegram:
+
+- `/start` — begin a request  
+- `/cancel` — abort and delete the temporary session  
+
+Run **one** bot process per token.
+
+### Privacy
+
+Session rows in `aima_bot_sessions` expire after 30 minutes and are deleted after submit, `/cancel`, or cleanup. Only the server secret key can read them. Do not commit `.env`.
+
+---
+
+## Option B — Local one-time script
+
+No Telegram or Supabase. Data stays in a local JSON config (gitignored).
+
+**Passport**
+
+```bash
+cp aima_config.example.json aima_config.json
+# edit aima_config.json
+source .venv/bin/activate
+python aima_form.py
+```
+
+**Residence permit**
+
+```bash
+cp aima_residence_config.example.json aima_residence_config.json
+# edit aima_residence_config.json
+source .venv/bin/activate
+python aima_residence_form.py
+```
+
+The script opens the browser, emails you an MFA code, asks for it in the terminal, then submits. On success it prints the tracking URL.
+
+---
+
+## Known limitation: reCAPTCHA
+
+AIMA uses **reCAPTCHA Enterprise**. MFA often works; **form submit may still fail** with:
+
+`A validação de reCAPTCHA falhou. Tente novamente.`
+
+That is Google scoring the automated browser, not a bad passport/email. A persistent profile (`.pw-profile`) can help a little after repeated local use, but there is no reliable fully automatic bypass in this project.
+
+## Project layout
+
+| File | Role |
+|------|------|
+| `telegram_bot.py` | Telegram conversation + Supabase sessions |
+| `aima_service.py` | Shared Playwright worker (MFA + submit) |
+| `aima_form.py` | One-shot passport CLI |
+| `aima_residence_form.py` | One-shot residence CLI |
+| `supabase_schema.sql` | Bot session table |
+| `run_bot.sh` | venv + deps + start bot |
+| `requirements.txt` | Python dependencies |
+
+## License / disclaimer
+
+This tool automates a public government web form for convenience. It may break when AIMA changes their site. Review their terms before using it for others.

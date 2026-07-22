@@ -3,9 +3,11 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -16,8 +18,16 @@ from telegram.ext import (
     filters,
 )
 
-from aima_service import AimaError, FormData, request_mfa, submit_form
+from aima_service import (
+    AimaError,
+    FormData,
+    request_mfa,
+    start_browser,
+    stop_browser,
+    submit_form,
+)
 
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -29,11 +39,287 @@ SESSION_TTL = timedelta(minutes=30)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def tip_url() -> str:
+    return os.getenv("BUYMEACOFFEE_URL", "").strip()
+
+
+def identity_label(flow: str) -> str:
+    return "passport number" if flow == "passport" else "residence permit number"
+
+
+def format_confirmation(flow: str, data: dict) -> str:
+    return (
+        "Please confirm your data:\n\n"
+        f"Name: {data['full_name']}\n"
+        f"Birth date: {data['birth_date']}\n"
+        f"Country: {data['country_iso_code']}\n"
+        f"{identity_label(flow).capitalize()}: {data['identity_number']}\n"
+        f"Email: {data['email']}\n\n"
+        "Submit this request?"
+    )
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Confirm",
+                    callback_data="confirm:yes",
+                ),
+                InlineKeyboardButton(
+                    "Edit",
+                    callback_data="confirm:edit",
+                ),
+            ]
+        ]
+    )
+
+
+def edit_keyboard(flow: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Name", callback_data="edit:full_name")],
+            [InlineKeyboardButton("Birth date", callback_data="edit:birth_date")],
+            [InlineKeyboardButton("Country", callback_data="edit:country")],
+            [
+                InlineKeyboardButton(
+                    identity_label(flow).capitalize(),
+                    callback_data="edit:identity_number",
+                )
+            ],
+            [InlineKeyboardButton("Email", callback_data="edit:email")],
+            [InlineKeyboardButton("Back", callback_data="edit:back")],
+        ]
+    )
+
+
+EDIT_PROMPTS = {
+    "full_name": "Enter your full name:",
+    "birth_date": "Enter your birth date as YYYY-MM-DD:",
+    "country": "Enter your two-letter country code, for example PT or UA:",
+    "identity_number": None,  # filled from flow
+    "email": "Enter your email address:",
+}
+
+
+async def submit_confirmed_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    flow: str,
+    data: dict,
+) -> None:
+    await _store(context).save(user_id, chat_id, flow, "submitting", data)
+    await context.bot.send_message(
+        chat_id,
+        "Submitting your request. This may take a moment…",
+    )
+    form = FormData(
+        identity_type=flow,
+        identity_number=data["identity_number"],
+        birth_date=data["birth_date"],
+        country_iso_code=data["country_iso_code"],
+        full_name=data["full_name"],
+        email=data["email"],
+    )
+    try:
+        tracking_token = await asyncio.to_thread(
+            submit_form, form, data["mfa_code"]
+        )
+    except Exception as error:
+        LOGGER.exception("Submission failed for Telegram user %s", user_id)
+        reason = str(error) if isinstance(error, AimaError) else "Browser error"
+        is_recaptcha = "recaptcha" in reason.lower()
+        retry_data = dict(data)
+        retry_data.pop("mfa_code", None)
+        if is_recaptcha:
+            await _store(context).save(
+                user_id, chat_id, flow, "confirm", retry_data
+            )
+            await context.bot.send_message(
+                chat_id,
+                f"Submission failed:\n{reason}\n\n"
+                "Google scored this attempt as automated. Your data is still "
+                "saved — tap Confirm to request a new email code and try again. "
+                "Keep the Chrome window in the foreground.\n\n"
+                + format_confirmation(flow, retry_data),
+                reply_markup=confirm_keyboard(),
+            )
+            return
+
+        await _store(context).delete(user_id)
+        await context.bot.send_message(
+            chat_id,
+            f"Submission failed:\n{reason}\n\n"
+            "The temporary data was deleted. Send /start to try again.",
+        )
+        return
+
+    await _store(context).delete(user_id)
+    lines = ["Request submitted successfully."]
+    if tracking_token:
+        lines.append(
+            f"Tracking: https://contactenos.aima.gov.pt/tracking/{tracking_token}"
+        )
+    lines.append("Your temporary data was deleted.")
+    await context.bot.send_message(chat_id, "\n\n".join(lines))
+
+    donate = tip_url()
+    if donate:
+        await asyncio.sleep(2)
+        await context.bot.send_message(
+            chat_id,
+            "✨☕ If this helped, you can leave a small voluntary tip "
+            f"(about €1-2) here:\n{donate}",
+        )
+
+
+async def request_mfa_for_session(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    flow: str,
+    data: dict,
+    *,
+    retry_step: str = "confirm",
+) -> None:
+    await _store(context).save(user_id, chat_id, flow, "requesting_mfa", data)
+    await context.bot.send_message(
+        chat_id,
+        "Requesting your verification code. This may take a moment…",
+    )
+    try:
+        await asyncio.to_thread(request_mfa, data["email"])
+    except Exception as error:
+        LOGGER.exception("MFA request failed for Telegram user %s", user_id)
+        await _store(context).save(user_id, chat_id, flow, retry_step, data)
+        reason = str(error) if isinstance(error, AimaError) else "Browser error"
+        if retry_step == "confirm":
+            await context.bot.send_message(
+                chat_id,
+                f"Could not request the code:\n{reason}\n\n"
+                + format_confirmation(flow, data),
+                reply_markup=confirm_keyboard(),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"Could not request the code:\n{reason}\n\n"
+                "Send /start to try again.",
+            )
+        return
+
+    await _store(context).save(user_id, chat_id, flow, "mfa", data)
+    await context.bot.send_message(
+        chat_id,
+        "Check your email and enter the six-digit verification code:",
+    )
+
+
+async def confirm_submit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    chat = update.effective_chat
+    if query is None or user is None or chat is None:
+        return
+
+    await query.answer()
+    session = await _store(context).get(user.id)
+    if session is None or session["step"] != "confirm":
+        await query.edit_message_text("No pending confirmation. Send /start.")
+        return
+
+    decision = query.data.split(":", 1)[1]
+    if decision == "edit":
+        await _store(context).save(
+            user.id,
+            chat.id,
+            session["flow"],
+            "edit_menu",
+            dict(session["data"]),
+        )
+        await query.edit_message_text(
+            "What do you want to edit?",
+            reply_markup=edit_keyboard(session["flow"]),
+        )
+        return
+
+    await query.edit_message_text("Confirmed.")
+    await request_mfa_for_session(
+        context,
+        user.id,
+        chat.id,
+        session["flow"],
+        dict(session["data"]),
+    )
+
+
+async def choose_edit_field(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    chat = update.effective_chat
+    if query is None or user is None or chat is None:
+        return
+
+    await query.answer()
+    session = await _store(context).get(user.id)
+    if session is None or session["step"] != "edit_menu":
+        await query.edit_message_text("No pending edit. Send /start.")
+        return
+
+    field = query.data.split(":", 1)[1]
+    data = dict(session["data"])
+    if field == "back":
+        await _store(context).save(
+            user.id, chat.id, session["flow"], "confirm", data
+        )
+        await query.edit_message_text(
+            format_confirmation(session["flow"], data),
+            reply_markup=confirm_keyboard(),
+        )
+        return
+
+    await _store(context).save(
+        user.id,
+        chat.id,
+        session["flow"],
+        f"edit_{field}",
+        data,
+    )
+    prompt = EDIT_PROMPTS[field]
+    if field == "identity_number":
+        prompt = f"Enter your {identity_label(session['flow'])}:"
+    await query.edit_message_text(prompt)
+
+
+def parse_supabase_timestamp(value: str) -> datetime:
+    # Python 3.9 fromisoformat rejects fractional seconds that aren't exactly
+    # 0/3/6 digits, e.g. "...25.09323+00:00" from Postgres/Supabase.
+    normalized = value.replace("Z", "+00:00")
+    match = re.fullmatch(
+        r"(.*T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})",
+        normalized,
+    )
+    if match:
+        base, fraction, offset = match.groups()
+        micros = (fraction or ".")[1:].ljust(6, "0")[:6]
+        normalized = f"{base}.{micros}{offset}" if micros else f"{base}{offset}"
+    return datetime.fromisoformat(normalized)
+
+
 class SessionStore:
     def __init__(self, url: str, service_role_key: str) -> None:
-        self.endpoint = (
-            f"{url.rstrip('/')}/rest/v1/aima_bot_sessions"
-        )
+        base = url.strip().rstrip("/")
+        if base.endswith("/rest/v1"):
+            base = base[: -len("/rest/v1")]
+        self.endpoint = f"{base}/rest/v1/aima_bot_sessions"
         headers = {
             "apikey": service_role_key,
             "Content-Type": "application/json",
@@ -85,9 +371,7 @@ class SessionStore:
             return None
 
         session = rows[0]
-        expires_at = datetime.fromisoformat(
-            session["expires_at"].replace("Z", "+00:00")
-        )
+        expires_at = parse_supabase_timestamp(session["expires_at"])
         if expires_at <= datetime.now(timezone.utc):
             await self.delete(user_id)
             return None
@@ -302,11 +586,7 @@ async def handle_answer(
             await message.reply_text("Enter exactly two letters.")
             return
         data["country_iso_code"] = country
-        label = (
-            "passport number"
-            if session["flow"] == "passport"
-            else "residence permit number"
-        )
+        label = identity_label(session["flow"])
         await _save_and_prompt(
             update,
             context,
@@ -341,43 +621,14 @@ async def handle_answer(
             user.id,
             chat.id,
             session["flow"],
-            "requesting_mfa",
+            "confirm",
             data,
         )
         await _delete_sensitive_input(update)
         await context.bot.send_message(
             chat.id,
-            "Requesting your verification code. This may take a moment…",
-        )
-        try:
-            await asyncio.to_thread(request_mfa, text)
-        except Exception as error:
-            LOGGER.exception("MFA request failed for Telegram user %s", user.id)
-            await _store(context).save(
-                user.id,
-                chat.id,
-                session["flow"],
-                "email",
-                data,
-            )
-            reason = str(error) if isinstance(error, AimaError) else "Browser error"
-            await context.bot.send_message(
-                chat.id,
-                f"Could not request the code: {reason}\n"
-                "Check the email and send it again, or use /cancel.",
-            )
-            return
-
-        await _store(context).save(
-            user.id,
-            chat.id,
-            session["flow"],
-            "mfa",
-            data,
-        )
-        await context.bot.send_message(
-            chat.id,
-            "Check your email and enter the six-digit verification code:",
+            format_confirmation(session["flow"], data),
+            reply_markup=confirm_keyboard(),
         )
         return
 
@@ -385,43 +636,63 @@ async def handle_answer(
         if not re.fullmatch(r"\d{6}", text):
             await message.reply_text("Enter exactly six digits.")
             return
-        await _store(context).save(
+        data["mfa_code"] = text
+        await _delete_sensitive_input(update)
+        await submit_confirmed_request(
+            context,
             user.id,
             chat.id,
             session["flow"],
-            "submitting",
             data,
+        )
+        return
+
+    if step.startswith("edit_"):
+        field = step[len("edit_"):]
+        if field == "full_name":
+            if len(text) < 2:
+                await message.reply_text("Enter a valid full name.")
+                return
+            data["full_name"] = text
+        elif field == "birth_date":
+            try:
+                parsed_date = date.fromisoformat(text)
+                if parsed_date >= date.today():
+                    raise ValueError
+            except ValueError:
+                await message.reply_text(
+                    "Invalid date. Use YYYY-MM-DD, for example 1990-01-31."
+                )
+                return
+            data["birth_date"] = text
+        elif field == "country":
+            country = text.upper()
+            if not re.fullmatch(r"[A-Z]{2}", country):
+                await message.reply_text("Enter exactly two letters.")
+                return
+            data["country_iso_code"] = country
+        elif field == "identity_number":
+            if len(text) < 3:
+                await message.reply_text("Enter a valid document number.")
+                return
+            data["identity_number"] = text
+        elif field == "email":
+            if not EMAIL_PATTERN.fullmatch(text):
+                await message.reply_text("Enter a valid email address.")
+                return
+            data["email"] = text
+        else:
+            await message.reply_text("Unknown field. Send /start.")
+            return
+
+        await _store(context).save(
+            user.id, chat.id, session["flow"], "confirm", data
         )
         await _delete_sensitive_input(update)
         await context.bot.send_message(
             chat.id,
-            "Submitting your request. This may take a moment…",
-        )
-        form = FormData(
-            identity_type=session["flow"],
-            identity_number=data["identity_number"],
-            birth_date=data["birth_date"],
-            country_iso_code=data["country_iso_code"],
-            full_name=data["full_name"],
-            email=data["email"],
-        )
-        try:
-            await asyncio.to_thread(submit_form, form, text)
-        except Exception as error:
-            LOGGER.exception("Submission failed for Telegram user %s", user.id)
-            await _store(context).delete(user.id)
-            reason = str(error) if isinstance(error, AimaError) else "Browser error"
-            await context.bot.send_message(
-                chat.id,
-                f"Submission failed: {reason}\n"
-                "The temporary data was deleted. Send /start to try again.",
-            )
-            return
-
-        await _store(context).delete(user.id)
-        await context.bot.send_message(
-            chat.id,
-            "Request submitted successfully. Your temporary data was deleted.",
+            format_confirmation(session["flow"], data),
+            reply_markup=confirm_keyboard(),
         )
         return
 
@@ -439,10 +710,14 @@ async def on_error(
 
 async def post_init(application: Application) -> None:
     await application.bot_data["session_store"].cleanup_expired()
+    await asyncio.to_thread(start_browser)
+    LOGGER.info("Persistent AIMA browser session is ready.")
 
 
 async def post_shutdown(application: Application) -> None:
+    await asyncio.to_thread(stop_browser)
     await application.bot_data["session_store"].close()
+    LOGGER.info("Persistent AIMA browser session was closed.")
 
 
 def require_env(name: str) -> str:
@@ -475,6 +750,15 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(choose_flow, pattern=r"^flow:(passport|residence)$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(confirm_submit, pattern=r"^confirm:(yes|edit)$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            choose_edit_field,
+            pattern=r"^edit:(full_name|birth_date|country|identity_number|email|back)$",
+        )
     )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer)
