@@ -1,7 +1,7 @@
 # Get AIMA status
 
 Unofficial helper for Portugal’s [AIMA contact form](https://contactenos.aima.gov.pt/contact-form).  
-It requests a status update for a **passport** or **residence permit** (topic/subtopic used by the public form).
+It requests a status update for a **residence permit** based on **passport** or **residence permit** numbers.
 
 Not affiliated with AIMA. Use at your own risk and only with your own data.
 
